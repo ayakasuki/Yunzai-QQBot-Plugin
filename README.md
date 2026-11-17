@@ -1,3 +1,7 @@
+> **⚠️ 自维护魔改版**：本仓库基线上游 `60a2e87`，修了按钮回调登记持久化、交互事件回应、
+> 按钮必填字段等 4 处问题，详见 [PATCHES.md](./PATCHES.md)；SDK 用配套的
+> [ayakasuki/qq-group-bot](https://github.com/ayakasuki/qq-group-bot)。
+
 <div align="center">
 
 # TRSS-Yunzai QQBot Plugin

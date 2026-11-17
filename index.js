@@ -10,6 +10,47 @@ import urlRegexSafe from "url-regex-safe"
 import { encode as encodeSilk, isSilk } from "silk-wasm"
 import QQBot from "qq-group-bot"
 
+// ===== 按钮回调登记表持久化（桃妹补丁）=====
+// 登记表原本只在内存里，机器人一重启，历史消息上的按钮就全部失效（点击还会弹「服务异常」）。
+// 这里把它落到 data/QQBot/callback-<id>.json，重启后自动恢复。
+const CALLBACK_DIR = path.join("data", "QQBot")
+const CALLBACK_TTL = 7 * 24 * 60 * 60 * 1000
+const callbackSaveTimers = {}
+
+async function loadCallbackStore(id) {
+  try {
+    const raw = await fs.readFile(path.join(CALLBACK_DIR, `callback-${id}.json`), "utf8")
+    const now = Date.now()
+    const out = {}
+    let n = 0
+    for (const [k, v] of Object.entries(JSON.parse(raw)))
+      if (v && (!v.expire || v.expire > now)) { out[k] = v; n++ }
+    if (n) logger.info(`[QQBot] 已恢复 ${n} 个按钮回调登记`)
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveCallbackStore(id, callback) {
+  if (!id || callbackSaveTimers[id]) return
+  callbackSaveTimers[id] = setTimeout(async () => {
+    delete callbackSaveTimers[id]
+    try {
+      const now = Date.now()
+      const out = {}
+      for (const [k, v] of Object.entries(callback || {}))
+        if (v && typeof v === "object" && (!v.expire || v.expire > now)) out[k] = v
+      await fs.mkdir(CALLBACK_DIR, { recursive: true })
+      await fs.writeFile(path.join(CALLBACK_DIR, `callback-${id}.json`), JSON.stringify(out))
+    } catch (err) {
+      logger.error(`[QQBot] 保存按钮回调登记失败：${err?.message || err}`)
+    }
+  }, 2000)
+  callbackSaveTimers[id]?.unref?.()
+}
+// ===== 补丁结束 =====
+
 import { QQEvent } from "qq-group-bot/lib/event/index.js"
 QQEvent.GROUP_MESSAGE_CREATE = QQEvent.GROUP_AT_MESSAGE_CREATE
 QQBot.Message.parse = eval(
@@ -134,6 +175,7 @@ const adapter = new (class QQBotAdapter {
   }
 
   async makeMarkdownImage(data, file, summary = "图片") {
+    if (file instanceof URL) file = file.href
     if (sharp) file = await this.compressImage(data, file)
     const buffer = await Bot.Buffer(file)
     const image = (await this.makeBotImage(buffer)) || { url: await Bot.fileToUrl(file) }
@@ -158,7 +200,8 @@ const adapter = new (class QQBotAdapter {
       id: ulid(),
       render_data: {
         label: button.text,
-        visited_label: button.clicked_text,
+        // [桃妹补丁] QQ 文档里 visited_label 是必填项，未提供时回退成 label，否则客户端可能弹「机器人服务异常」
+        visited_label: button.clicked_text ?? button.text,
         style,
         ...button.QQBot?.render_data,
       },
@@ -170,6 +213,8 @@ const adapter = new (class QQBotAdapter {
         permission: { type: 2 },
         data: button.input,
         enter: button.send,
+        // [桃妹补丁] unsupport_tips 是 QQ 必填项
+        unsupport_tips: button.unsupport_tips || "当前客户端不支持此操作",
         ...button.QQBot?.action,
       }
     else if (button.callback) {
@@ -177,7 +222,9 @@ const adapter = new (class QQBotAdapter {
         msg.action = {
           type: 1,
           permission: { type: 2 },
-          ...button.QQBot?.action,
+          // [桃妹补丁] unsupport_tips 是 QQ 必填项
+        unsupport_tips: button.unsupport_tips || "当前客户端不支持此操作",
+        ...button.QQBot?.action,
         }
         if (!Array.isArray(data._ret_id)) data._ret_id = []
         data.bot.callback[msg.id] = {
@@ -186,8 +233,10 @@ const adapter = new (class QQBotAdapter {
           group_id: data.group_id,
           message: button.callback,
           message_id: data._ret_id,
+          expire: Date.now() + CALLBACK_TTL,
         }
-        setTimeout(() => delete data.bot.callback[msg.id], 300000)
+        setTimeout(() => delete data.bot.callback[msg.id], CALLBACK_TTL) // 原为 5 分钟
+        saveCallbackStore(data.bot.uin, data.bot.callback)
       } else {
         msg.action = {
           type: 2,
@@ -202,6 +251,8 @@ const adapter = new (class QQBotAdapter {
         type: 0,
         permission: { type: 2 },
         data: button.link,
+        // [桃妹补丁] unsupport_tips 是 QQ 必填项
+        unsupport_tips: button.unsupport_tips || "当前客户端不支持此操作",
         ...button.QQBot?.action,
       }
     else return false
@@ -1227,11 +1278,22 @@ const adapter = new (class QQBotAdapter {
 
   async makeCallback(id, event) {
     const reply = event.reply.bind(event)
-    event.reply = async (...args) => {
+    event.reply = async (...codeArgs) => {
+      // QQ 文档：interaction_id 取自事件 d.id，且「不带 INTERACTION_CREATE: 前缀」，
+      // 而 qq-group-bot 的 notice_id 原样带着前缀 → 这里手动剥掉，并把响应体打出来核查
+      if (event.replied) return true
+      event.replied = true
+      const code = codeArgs[0] ?? 0
+      const clean = String(event.notice_id).replace(/^INTERACTION_CREATE:/, "")
       try {
-        return await reply(...args)
+        const res = await event.bot.request.put(`/interactions/${clean}`, { code })
+        Bot.makeLog("error", [
+          `[ack] id=${clean} code=${code} status=${res?.status} body=${JSON.stringify(res?.data)}`,
+        ], id)
+        return res?.status === 200
       } catch (err) {
-        Bot.makeLog("debug", ["回复按钮点击事件错误", err], data.self_id)
+        Bot.makeLog("error", ["回应按钮交互失败", `id=${clean}`, err?.data || err?.message || err], id)
+        return false
       }
     }
 
@@ -1270,7 +1332,12 @@ const adapter = new (class QQBotAdapter {
         data.message.push({ type: "text", text: event.data?.resolved?.button_data })
         data.raw_message += event.data?.resolved?.button_data
       } else {
-        event.reply(1)
+        // 原来这里 event.reply(1)：QQ 会据此在客户端弹「机器人服务异常」。
+        // 未命中的常见原因是机器人重启过、或按钮超过登记有效期，没必要吓用户，静默忽略即可。
+        Bot.makeLog("warn", [
+          "按钮交互未找到回调登记（机器人重启过或超过有效期），已忽略",
+          event.data?.resolved?.button_id,
+        ], data.self_id)
       }
     }
     event.reply(0)
@@ -1420,7 +1487,7 @@ const adapter = new (class QQBotAdapter {
       gl: await this.getGroupMap(id),
       gml: await this.getMemberMap(id),
 
-      callback: {},
+      callback: await loadCallbackStore(id),
     }
 
     Bot[id].sdk.logger = {}

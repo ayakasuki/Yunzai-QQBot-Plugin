@@ -3,11 +3,16 @@
   "type": "module",
   "author": "TimeRainStarSky",
   "dependencies": {
-    "qq-group-bot": "1.1.0",
+    "qq-group-bot": "github:ayakasuki/qq-group-bot#master",
     "qrcode": "^1.5.4",
     "sharp": "^0.34.5",
     "silk-wasm": "^3.7.1",
     "tweetnacl": "^1.0.3",
     "url-regex-safe": "^4.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayakasuki/Yunzai-QQBot-Plugin.git"
+  },
+  "description": "TRSS-Yunzai QQBot 适配器插件 (ayakasuki 自维护魔改版)"
 }
